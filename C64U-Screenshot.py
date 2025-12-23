@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 """
-C64U-Screenshot - Capture screenshots from Ultimate 64 via Web API
+C64U-Screenshot - Ultimate 64 Screenshot Capture Tool
+Captures a screenshot from a running Ultimate 64 via the Web API.
 
-Copyright (C) 2024 Garland Glessner <gglessner@gmail.com>
+Supports all C64 graphics modes including cases where graphics data is stored
+under ROM (VIC bank 3 at $E000-$FFFF). Uses an NMI-based ROM bypass technique
+to read RAM hidden under Kernal ROM.
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program. If not, see <https://www.gnu.org/licenses/>.
+Author: Garland Glessner <gglessner@gmail.com>
+License: GNU General Public License v3.0
+Repository: https://github.com/gglessner/C64U-Screenshot
 
 Usage: python C64U-Screenshot.py <IP_ADDRESS> [output.png] [options]
 """
@@ -23,11 +17,11 @@ Usage: python C64U-Screenshot.py <IP_ADDRESS> [output.png] [options]
 __author__ = "Garland Glessner"
 __email__ = "gglessner@gmail.com"
 __license__ = "GPL-3.0"
-__version__ = "1.0.0"
 
 import sys
+import time
 import requests
-from PIL import Image
+from PIL import Image, ImageDraw
 
 # C64 color palette (VICE default)
 C64_PALETTE = [
@@ -48,6 +42,14 @@ C64_PALETTE = [
     (0x6C, 0x5E, 0xB5),  # 14 Light Blue
     (0x95, 0x95, 0x95),  # 15 Light Grey
 ]
+
+# Buffer location for ROM copy (using $4000-$5FFF, 8KB in VIC bank 1)
+# This area is typically safe as it's not commonly used for screen memory
+COPY_BUFFER = 0x4000
+COPY_BUFFER_SIZE = 0x2000  # 8KB
+
+# Stub routine location (a small area for our injected code)
+STUB_ADDR = 0x0340  # Cassette buffer area, usually safe
 
 
 class Ultimate64API:
@@ -80,74 +82,58 @@ class Ultimate64API:
             return response.content
         return None
     
-    def read_memory_with_rom_warning(self, address, length):
-        """
-        Read memory, warning if address overlaps with ROM areas.
-        Note: Ultimate 64 DMA reads through a fixed memory map that includes
-        ROMs at their standard locations. RAM under ROMs cannot be accessed.
-        """
-        end_address = address + length - 1
-        
-        # Check for ROM conflicts: BASIC ($A000-$BFFF), Kernal ($E000-$FFFF)
-        if (address <= 0xBFFF and end_address >= 0xA000) or \
-           (address <= 0xFFFF and end_address >= 0xE000):
-            print(f"  Warning: Address ${address:04X} overlaps with ROM area")
-            print(f"           VIC bank 3 graphics at $E000+ may render incorrectly")
-        
-        return self.read_memory(address, length)
-
-
+    def write_memory(self, address, data):
+        """Write memory to the C64 via DMA"""
+        url = f"{self.base_url}/v1/machine:writemem"
+        params = {"address": f"{address:X}"}
+        headers = dict(self.headers)
+        headers["Content-Type"] = "application/octet-stream"
+        try:
+            response = requests.post(url, params=params, data=data, headers=headers, timeout=5)
+            return response.status_code == 200
+        except:
+            return False
+    
 class VICIIState:
     """VIC-II chip state extracted from registers"""
     
     def __init__(self, vic_regs, cia2_data_port):
-        # Store raw register values
         self.raw_regs = vic_regs
         
-        # $D011 - Screen control register 1
         d011 = vic_regs[0x11]
         self.yscroll = d011 & 0x07
-        self.rsel = (d011 >> 3) & 1  # Row select (24/25 rows)
-        self.den = (d011 >> 4) & 1   # Display enable
-        self.bmm = (d011 >> 5) & 1   # Bitmap mode
-        self.ecm = (d011 >> 6) & 1   # Extended color mode
+        self.rsel = (d011 >> 3) & 1
+        self.den = (d011 >> 4) & 1
+        self.bmm = (d011 >> 5) & 1
+        self.ecm = (d011 >> 6) & 1
         
-        # $D016 - Screen control register 2
         d016 = vic_regs[0x16]
         self.xscroll = d016 & 0x07
-        self.csel = (d016 >> 3) & 1  # Column select (38/40 cols)
-        self.mcm = (d016 >> 4) & 1   # Multicolor mode
+        self.csel = (d016 >> 3) & 1
+        self.mcm = (d016 >> 4) & 1
         
-        # $D018 - Memory setup register
         d018 = vic_regs[0x18]
-        self.char_mem_offset = ((d018 >> 1) & 0x07) * 0x800  # Character memory offset within bank
-        self.screen_mem_offset = ((d018 >> 4) & 0x0F) * 0x400  # Screen memory offset within bank
-        
-        # In bitmap mode, bit 3 of (d018 >> 1) selects 0x0000 or 0x2000 within bank
+        self.char_mem_offset = ((d018 >> 1) & 0x07) * 0x800
+        self.screen_mem_offset = ((d018 >> 4) & 0x0F) * 0x400
         self.bitmap_mem_offset = ((d018 >> 3) & 1) * 0x2000
         
-        # CIA2 $DD00 bits 0-1 select VIC bank (inverted)
         vic_bank_bits = cia2_data_port & 0x03
-        self.vic_bank = (3 - vic_bank_bits) * 0x4000  # Banks: 0=$0000, 1=$4000, 2=$8000, 3=$C000
+        self.vic_bank = (3 - vic_bank_bits) * 0x4000
         
-        # Calculate absolute memory addresses
         self.screen_mem_addr = self.vic_bank + self.screen_mem_offset
         self.char_mem_addr = self.vic_bank + self.char_mem_offset
         self.bitmap_mem_addr = self.vic_bank + self.bitmap_mem_offset
         
-        # Colors
         self.border_color = vic_regs[0x20] & 0x0F
         self.background_color = vic_regs[0x21] & 0x0F
         self.background_color1 = vic_regs[0x22] & 0x0F
         self.background_color2 = vic_regs[0x23] & 0x0F
         self.background_color3 = vic_regs[0x24] & 0x0F
         
-        # Sprite registers
-        self.sprite_multicolor0 = vic_regs[0x25] & 0x0F  # $D025
-        self.sprite_multicolor1 = vic_regs[0x26] & 0x0F  # $D026
-        
+        self.sprite_multicolor0 = vic_regs[0x25] & 0x0F
+        self.sprite_multicolor1 = vic_regs[0x26] & 0x0F
+    
     def get_mode_name(self):
-        """Return the name of the current graphics mode"""
         if self.ecm and not self.bmm and not self.mcm:
             return "Extended Background Color Mode"
         elif not self.ecm and self.bmm and not self.mcm:
@@ -162,7 +148,6 @@ class VICIIState:
             return "Invalid/Unused Mode"
     
     def dump_info(self):
-        """Print debug info about VIC-II state"""
         print(f"Screen Mode: {self.get_mode_name()}")
         print(f"  BMM={self.bmm} ECM={self.ecm} MCM={self.mcm}")
         print(f"  DEN={self.den} (display {'enabled' if self.den else 'disabled'})")
@@ -176,42 +161,316 @@ class VICIIState:
         print(f"Background Color: {self.background_color}")
 
 
+def check_rom_overlap(address, length):
+    """Check if an address range overlaps with ROM areas"""
+    end_address = address + length - 1
+    
+    # Kernal ROM: $E000-$FFFF
+    if address <= 0xFFFF and end_address >= 0xE000:
+        overlap_start = max(address, 0xE000)
+        overlap_end = min(end_address, 0xFFFF)
+        return ("KERNAL", overlap_start, overlap_end, 0xE000, 0x2000)
+    
+    # BASIC ROM: $A000-$BFFF  
+    if address <= 0xBFFF and end_address >= 0xA000:
+        overlap_start = max(address, 0xA000)
+        overlap_end = min(end_address, 0xBFFF)
+        return ("BASIC", overlap_start, overlap_end, 0xA000, 0x2000)
+    
+    return None
+
+
+def generate_copy_stub(src_addr, dst_addr, length, jmp_target=None):
+    """
+    Generate 6502 machine code to copy memory with ROMs banked out.
+    
+    This routine:
+    1. Saves registers and $01
+    2. Banks out ROMs (sets $01 to $34)
+    3. Copies 'length' bytes from src_addr to dst_addr
+    4. Restores $01 and registers
+    5. Sets completion marker
+    6. Jumps to jmp_target (original NMI handler) or loops if None
+    
+    Returns: bytes of machine code
+    """
+    code = []
+    
+    # Save registers on stack
+    code.extend([0x48])                    # PHA - save A
+    code.extend([0x8A])                    # TXA
+    code.extend([0x48])                    # PHA - save X  
+    code.extend([0x98])                    # TYA
+    code.extend([0x48])                    # PHA - save Y
+    
+    # Save current $01 value
+    code.extend([0xA5, 0x01])              # LDA $01
+    code.extend([0x48])                    # PHA
+    
+    # Bank out all ROMs: $01 = $34 (RAM everywhere, I/O visible)
+    code.extend([0xA9, 0x34])              # LDA #$34
+    code.extend([0x85, 0x01])              # STA $01
+    
+    # Set up zero page pointers for copy
+    # $FB/$FC = source, $FD/$FE = destination
+    code.extend([0xA9, src_addr & 0xFF])   # LDA #<src
+    code.extend([0x85, 0xFB])              # STA $FB
+    code.extend([0xA9, (src_addr >> 8) & 0xFF])  # LDA #>src
+    code.extend([0x85, 0xFC])              # STA $FC
+    
+    code.extend([0xA9, dst_addr & 0xFF])   # LDA #<dst
+    code.extend([0x85, 0xFD])              # STA $FD
+    code.extend([0xA9, (dst_addr >> 8) & 0xFF])  # LDA #>dst
+    code.extend([0x85, 0xFE])              # STA $FE
+    
+    # Calculate number of pages to copy
+    num_pages = (length + 255) // 256
+    
+    # Outer loop counter in X (pages)
+    code.extend([0xA2, num_pages])         # LDX #num_pages
+    
+    # Copy loop (outer: pages, inner: bytes)
+    code.extend([0xA0, 0x00])              # LDY #$00  (inner loop: byte index)
+    code.extend([0xB1, 0xFB])              # LDA ($FB),Y  - load from source
+    code.extend([0x91, 0xFD])              # STA ($FD),Y  - store to dest
+    code.extend([0xC8])                    # INY
+    code.extend([0xD0, 0xF9])              # BNE inner_loop (-7)
+    
+    # Increment high bytes of pointers
+    code.extend([0xE6, 0xFC])              # INC $FC (source high byte)
+    code.extend([0xE6, 0xFE])              # INC $FE (dest high byte)
+    
+    # Decrement page counter
+    code.extend([0xCA])                    # DEX
+    code.extend([0xD0, 0xF0])              # BNE outer_loop (-16)
+    
+    # Restore $01
+    code.extend([0x68])                    # PLA
+    code.extend([0x85, 0x01])              # STA $01
+    
+    # Set completion marker
+    code.extend([0xA9, 0x42])              # LDA #$42 (marker value)
+    code.extend([0x85, 0x02])              # STA $02 (store marker at $02)
+    
+    # Restore registers (in reverse order of saving)
+    code.extend([0x68])                    # PLA - restore Y
+    code.extend([0xA8])                    # TAY
+    code.extend([0x68])                    # PLA - restore X
+    code.extend([0xAA])                    # TAX
+    code.extend([0x68])                    # PLA - restore A
+    
+    if jmp_target is not None:
+        # Jump to original handler (e.g., Kernal NMI handler)
+        # This lets the original handler do proper RTI
+        code.extend([0x4C, jmp_target & 0xFF, (jmp_target >> 8) & 0xFF])
+    else:
+        # Loop forever - wait to be re-frozen
+        loop_addr = len(code)
+        loop_target = STUB_ADDR + loop_addr
+        code.extend([0x4C, loop_target & 0xFF, (loop_target >> 8) & 0xFF])
+    
+    return bytes(code)
+
+
+def read_memory_via_copy(api, src_addr, length, vic):
+    """
+    Read memory that might be under ROM by injecting a copy routine.
+    
+    This is the core of the ROM bypass functionality:
+    1. Save the current state at key memory locations
+    2. Inject a copy routine that banks out ROMs and copies data
+    3. Inject a JMP to the copy routine at a safe interrupt vector
+    4. Resume briefly to execute the copy
+    5. Re-freeze and read the copied data
+    6. Restore all modified memory
+    """
+    print(f"  ROM bypass: Copying ${src_addr:04X}-${src_addr+length-1:04X} to buffer at ${COPY_BUFFER:04X}")
+    
+    # Step 1: Back up memory we'll modify
+    # - The stub area (copy routine)
+    # - The buffer area (where we'll copy to)
+    # - Zero page locations we use ($FB-$FE)
+    # - The NMI vector area (we'll use this to trigger our code)
+    
+    print("  Backing up memory...")
+    
+    # Save stub area
+    stub_backup = api.read_memory(STUB_ADDR, 128)
+    if stub_backup is None:
+        print("  Error: Failed to backup stub area")
+        return None
+    
+    # Save buffer area
+    buffer_backup = api.read_memory(COPY_BUFFER, length)
+    if buffer_backup is None:
+        print("  Error: Failed to backup buffer area")
+        return None
+    
+    # Save zero page pointers
+    zp_backup = api.read_memory(0xFB, 4)
+    if zp_backup is None:
+        print("  Error: Failed to backup zero page")
+        return None
+    
+    # Save marker location
+    marker_backup = api.read_memory(0x02, 1)
+    
+    # Use NMI vector ($0318-$0319) - NMI is non-maskable, harder to disable
+    nmi_vector_backup = api.read_memory(0x0318, 2)
+    if nmi_vector_backup is None:
+        print("  Error: Failed to backup NMI vector")
+        return None
+    
+    # Get the original NMI handler address so we can jump to it when done
+    original_nmi_handler = nmi_vector_backup[0] + (nmi_vector_backup[1] << 8)
+    print(f"  Original NMI handler: ${original_nmi_handler:04X}")
+    
+    # Also backup CIA2 state for NMI triggering
+    cia2_icr_backup = api.read_memory(0xDD0D, 1)
+    cia2_timer_backup = api.read_memory(0xDD04, 3)  # Timer A low, high, control
+    
+    try:
+        # Step 2: Generate copy routine that jumps to original NMI handler when done
+        print("  Injecting copy routine...")
+        copy_code = generate_copy_stub(src_addr, COPY_BUFFER, length, jmp_target=original_nmi_handler)
+        print(f"    Stub size: {len(copy_code)} bytes at ${STUB_ADDR:04X}")
+        print(f"    Copy: ${src_addr:04X} -> ${COPY_BUFFER:04X}, {length} bytes ({(length+255)//256} pages)")
+        print(f"    Will jump to original handler at ${original_nmi_handler:04X} when done")
+        
+        if not api.write_memory(STUB_ADDR, copy_code):
+            print("  Error: Failed to write copy routine")
+            return None
+        
+        # Step 3: Modify NMI vector to point to our routine
+        nmi_vector = bytes([STUB_ADDR & 0xFF, (STUB_ADDR >> 8) & 0xFF])
+        if not api.write_memory(0x0318, nmi_vector):
+            print("  Error: Failed to modify NMI vector")
+            return None
+        
+        # Clear the completion marker
+        if not api.write_memory(0x02, bytes([0x00])):
+            print("  Error: Failed to clear marker")
+            return None
+        
+        # Step 4: Configure CIA2 to trigger NMI via Timer A
+        # CIA2 is at $DD00-$DD0F
+        # $DD04-$DD05: Timer A value
+        # $DD0E: Timer A control
+        # $DD0D: Interrupt Control Register (ICR)
+        print("  Triggering NMI via CIA2 timer...")
+        
+        # First, acknowledge any pending interrupts by reading ICR
+        api.read_memory(0xDD0D, 1)
+        
+        # Set timer to very short value
+        api.write_memory(0xDD04, bytes([0x02, 0x00]))  # Timer = 2 cycles
+        
+        # Enable Timer A NMI: write $81 to ICR (bit 7=set, bit 0=Timer A)
+        api.write_memory(0xDD0D, bytes([0x81]))
+        
+        # Start Timer A with force load: $11 = bit 0 (start) + bit 4 (force load)
+        api.write_memory(0xDD0E, bytes([0x11]))
+        
+        # Step 5: Resume and wait for copy to complete
+        print("  Executing copy routine...")
+        if not api.resume():
+            print("  Error: Failed to resume machine")
+            return None
+        
+        # Wait for the copy to complete
+        # 8KB copy at 1MHz takes ~100ms, so 500ms should be plenty
+        time.sleep(0.5)
+        
+        # Now pause and check if it completed
+        api.pause()
+        
+        marker = api.read_memory(0x02, 1)
+        
+        if marker and marker[0] == 0x42:
+            print("  Copy complete (marker verified)")
+            print("  Original NMI handler returned control to program")
+        else:
+            print(f"  Warning: Copy may have issues (marker={marker[0] if marker else 'None':02X}, expected 42)")
+        
+        # Step 5: Read the copied data from buffer
+        print("  Reading copied data from buffer...")
+        copied_data = api.read_memory(COPY_BUFFER, length)
+        
+        if copied_data is None:
+            print("  Error: Failed to read copied data")
+            return None
+        
+        return copied_data
+        
+    finally:
+        # Step 6: Restore all modified memory
+        print("  Restoring original memory...")
+        
+        # Make sure we're paused
+        api.pause()
+        
+        # Disable CIA2 Timer A NMI
+        api.write_memory(0xDD0D, bytes([0x01]))  # Clear Timer A NMI enable
+        
+        # Restore CIA2 timer state
+        if cia2_timer_backup:
+            api.write_memory(0xDD04, cia2_timer_backup)
+        
+        # Restore NMI vector
+        api.write_memory(0x0318, nmi_vector_backup)
+        
+        # Restore zero page
+        api.write_memory(0xFB, zp_backup)
+        
+        # Restore marker
+        if marker_backup:
+            api.write_memory(0x02, marker_backup)
+        
+        # Restore stub area
+        api.write_memory(STUB_ADDR, stub_backup)
+        
+        # Restore buffer area
+        api.write_memory(COPY_BUFFER, buffer_backup)
+        
+        print("  Memory restored")
+
+
+def read_memory_smart(api, address, length, vic):
+    """
+    Smart memory read that automatically handles ROM-shadowed areas.
+    Uses the copy routine bypass when necessary.
+    """
+    overlap = check_rom_overlap(address, length)
+    
+    if overlap is None:
+        # No ROM overlap, read directly
+        return api.read_memory(address, length)
+    
+    rom_name, overlap_start, overlap_end, rom_base, rom_size = overlap
+    print(f"  Detected {rom_name} ROM overlap at ${overlap_start:04X}-${overlap_end:04X}")
+    
+    # Use the ROM bypass copy routine
+    return read_memory_via_copy(api, address, length, vic)
+
+
 class SpriteInfo:
     """Information about a single sprite"""
     
     def __init__(self, sprite_num, vic_regs, sprite_pointer, vic_bank):
         self.num = sprite_num
-        
-        # X position: low byte from $D000+2*num, high bit from $D010
         x_low = vic_regs[sprite_num * 2]
         x_msb = (vic_regs[0x10] >> sprite_num) & 1
         self.x = x_low + (x_msb * 256)
-        
-        # Y position from $D001+2*num
         self.y = vic_regs[sprite_num * 2 + 1]
-        
-        # Enabled? ($D015)
         self.enabled = (vic_regs[0x15] >> sprite_num) & 1
-        
-        # Y expansion ($D017)
         self.y_expand = (vic_regs[0x17] >> sprite_num) & 1
-        
-        # Priority: 0 = in front of screen, 1 = behind screen ($D01B)
         self.priority = (vic_regs[0x1B] >> sprite_num) & 1
-        
-        # Multicolor mode ($D01C)
         self.multicolor = (vic_regs[0x1C] >> sprite_num) & 1
-        
-        # X expansion ($D01D)
         self.x_expand = (vic_regs[0x1D] >> sprite_num) & 1
-        
-        # Sprite color ($D027-$D02E)
         self.color = vic_regs[0x27 + sprite_num] & 0x0F
-        
-        # Sprite data address (pointer * 64 within VIC bank)
         self.data_addr = vic_bank + (sprite_pointer * 64)
         self.pointer = sprite_pointer
-        
+    
     def __repr__(self):
         status = "ON" if self.enabled else "off"
         mc = "MC" if self.multicolor else "HR"
@@ -227,7 +486,6 @@ class SpriteInfo:
 
 
 def get_sprite_info(vic_regs, sprite_pointers, vic_bank):
-    """Extract information about all 8 sprites"""
     sprites = []
     for i in range(8):
         sprite = SpriteInfo(i, vic_regs, sprite_pointers[i], vic_bank)
@@ -236,56 +494,37 @@ def get_sprite_info(vic_regs, sprite_pointers, vic_bank):
 
 
 def render_sprite(sprite, sprite_data, vic):
-    """
-    Render a single sprite to an RGBA image.
-    Returns (image, x_offset, y_offset) where offsets are for screen positioning.
-    Sprite coordinates are in VIC coordinates where visible screen starts at (24, 50).
-    """
-    # Sprite dimensions: 24x21 pixels (standard), doubled if expanded
     base_width = 24
     base_height = 21
-    
     width = base_width * (2 if sprite.x_expand else 1)
     height = base_height * (2 if sprite.y_expand else 1)
     
-    # Create RGBA image for transparency support
     img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
     pixels = img.load()
     
-    # Get colors
     sprite_color = C64_PALETTE[sprite.color]
     mc0 = C64_PALETTE[vic.sprite_multicolor0]
     mc1 = C64_PALETTE[vic.sprite_multicolor1]
     
-    # Sprite data is 63 bytes: 3 bytes per row, 21 rows
     for row in range(21):
         row_data = sprite_data[row * 3: row * 3 + 3]
         if len(row_data) < 3:
             continue
-            
-        # Combine 3 bytes into 24 bits
         bits = (row_data[0] << 16) | (row_data[1] << 8) | row_data[2]
         
         if sprite.multicolor:
-            # Multicolor: 12 double-width pixels per row
             for col in range(12):
                 bit_pair = (bits >> (22 - col * 2)) & 0x03
-                
                 if bit_pair == 0:
-                    # Transparent
                     color = None
                 elif bit_pair == 1:
-                    # Multicolor 0
                     color = mc0
                 elif bit_pair == 2:
-                    # Sprite color
                     color = sprite_color
-                else:  # bit_pair == 3
-                    # Multicolor 1
+                else:
                     color = mc1
                 
                 if color is not None:
-                    # Each multicolor pixel is 2 pixels wide
                     x_base = col * 2
                     for dx in range(2 * (2 if sprite.x_expand else 1)):
                         for dy in range(2 if sprite.y_expand else 1):
@@ -294,10 +533,8 @@ def render_sprite(sprite, sprite_data, vic):
                             if 0 <= px < width and 0 <= py < height:
                                 pixels[px, py] = (*color, 255)
         else:
-            # Hi-res: 24 pixels per row
             for col in range(24):
                 bit = (bits >> (23 - col)) & 1
-                
                 if bit:
                     for dx in range(2 if sprite.x_expand else 1):
                         for dy in range(2 if sprite.y_expand else 1):
@@ -306,44 +543,17 @@ def render_sprite(sprite, sprite_data, vic):
                             if 0 <= px < width and 0 <= py < height:
                                 pixels[px, py] = (*sprite_color, 255)
     
-    # Convert VIC sprite coordinates to screen coordinates
-    # VIC visible area starts at X=24, Y=50 (for NTSC) or Y=51 (PAL)
-    # Screen area is 320x200 starting at those offsets
     screen_x = sprite.x - 24
     screen_y = sprite.y - 50
-    
     return img, screen_x, screen_y
 
 
-def overlay_sprites(screen_img, sprites, sprite_data_list, vic, behind_only=False, front_only=False):
-    """
-    Overlay sprites onto the screen image.
-    
-    Args:
-        screen_img: The base screen image (RGB)
-        sprites: List of SpriteInfo objects
-        sprite_data_list: List of 64-byte sprite data for each sprite
-        vic: VICIIState object
-        behind_only: Only render sprites with priority=1 (behind screen)
-        front_only: Only render sprites with priority=0 (in front of screen)
-    
-    Returns:
-        New image with sprites overlaid
-    """
-    # Convert to RGBA for compositing
+def overlay_sprites(screen_img, sprites, sprite_data_list, vic, front_only=False):
     result = screen_img.convert('RGBA')
     
-    # Sort sprites by number (lower numbers have higher priority in C64)
-    # Actually on C64, sprite 0 has highest priority and is drawn LAST (on top)
-    # So we render in reverse order: 7, 6, 5, 4, 3, 2, 1, 0
     for i in range(7, -1, -1):
         sprite = sprites[i]
-        
         if not sprite.enabled:
-            continue
-            
-        # Filter by priority if requested
-        if behind_only and sprite.priority == 0:
             continue
         if front_only and sprite.priority == 1:
             continue
@@ -354,8 +564,6 @@ def overlay_sprites(screen_img, sprites, sprite_data_list, vic, behind_only=Fals
         
         sprite_img, x, y = render_sprite(sprite, sprite_data, vic)
         
-        # Paste sprite onto result using alpha compositing
-        # Only paste the visible portion
         if x < screen_img.width and y < screen_img.height:
             if x + sprite_img.width > 0 and y + sprite_img.height > 0:
                 result.paste(sprite_img, (x, y), sprite_img)
@@ -364,8 +572,6 @@ def overlay_sprites(screen_img, sprites, sprite_data_list, vic, behind_only=Fals
 
 
 def render_standard_text_mode(vic, screen_mem, color_mem, char_rom):
-    """Render standard text mode (40x25 characters, 8x8 pixels each)"""
-    # Create image: 320x200 pixels
     img = Image.new('RGB', (320, 200), C64_PALETTE[vic.background_color])
     pixels = img.load()
     
@@ -374,8 +580,6 @@ def render_standard_text_mode(vic, screen_mem, color_mem, char_rom):
             screen_pos = row * 40 + col
             char_code = screen_mem[screen_pos]
             color_idx = color_mem[screen_pos] & 0x0F
-            
-            # Get character data (8 bytes per character)
             char_offset = char_code * 8
             
             for y in range(8):
@@ -385,12 +589,10 @@ def render_standard_text_mode(vic, screen_mem, color_mem, char_rom):
                         pixels[col * 8 + x, row * 8 + y] = C64_PALETTE[color_idx]
                     else:
                         pixels[col * 8 + x, row * 8 + y] = C64_PALETTE[vic.background_color]
-    
     return img
 
 
 def render_multicolor_text_mode(vic, screen_mem, color_mem, char_rom):
-    """Render multicolor text mode"""
     img = Image.new('RGB', (320, 200), C64_PALETTE[vic.background_color])
     pixels = img.load()
     
@@ -400,15 +602,13 @@ def render_multicolor_text_mode(vic, screen_mem, color_mem, char_rom):
             char_code = screen_mem[screen_pos]
             color_byte = color_mem[screen_pos]
             color_idx = color_byte & 0x0F
-            is_multicolor = (color_byte & 0x08) != 0  # Bit 3 determines multicolor
-            
+            is_multicolor = (color_byte & 0x08) != 0
             char_offset = char_code * 8
             
             for y in range(8):
                 byte = char_rom[char_offset + y]
                 
                 if is_multicolor:
-                    # Multicolor: 4 pixel pairs, each 2 bits
                     for x in range(4):
                         bits = (byte >> (6 - x * 2)) & 0x03
                         if bits == 0:
@@ -417,23 +617,20 @@ def render_multicolor_text_mode(vic, screen_mem, color_mem, char_rom):
                             c = C64_PALETTE[vic.background_color1]
                         elif bits == 2:
                             c = C64_PALETTE[vic.background_color2]
-                        else:  # bits == 3
-                            c = C64_PALETTE[color_idx & 0x07]  # Only lower 3 bits
+                        else:
+                            c = C64_PALETTE[color_idx & 0x07]
                         pixels[col * 8 + x * 2, row * 8 + y] = c
                         pixels[col * 8 + x * 2 + 1, row * 8 + y] = c
                 else:
-                    # Standard hires within multicolor mode
                     for x in range(8):
                         if byte & (0x80 >> x):
                             pixels[col * 8 + x, row * 8 + y] = C64_PALETTE[color_idx]
                         else:
                             pixels[col * 8 + x, row * 8 + y] = C64_PALETTE[vic.background_color]
-    
     return img
 
 
 def render_hires_bitmap_mode(vic, bitmap_mem, screen_mem):
-    """Render standard (hi-res) bitmap mode"""
     img = Image.new('RGB', (320, 200), C64_PALETTE[vic.background_color])
     pixels = img.load()
     
@@ -443,8 +640,6 @@ def render_hires_bitmap_mode(vic, bitmap_mem, screen_mem):
             color_byte = screen_mem[screen_pos]
             fg_color = (color_byte >> 4) & 0x0F
             bg_color = color_byte & 0x0F
-            
-            # Bitmap data: 8 bytes per 8x8 cell, arranged in raster order
             bitmap_offset = char_row * 40 * 8 + char_col * 8
             
             for y in range(8):
@@ -454,12 +649,10 @@ def render_hires_bitmap_mode(vic, bitmap_mem, screen_mem):
                         pixels[char_col * 8 + x, char_row * 8 + y] = C64_PALETTE[fg_color]
                     else:
                         pixels[char_col * 8 + x, char_row * 8 + y] = C64_PALETTE[bg_color]
-    
     return img
 
 
 def render_multicolor_bitmap_mode(vic, bitmap_mem, screen_mem, color_mem):
-    """Render multicolor bitmap mode"""
     img = Image.new('RGB', (160, 200), C64_PALETTE[vic.background_color])
     pixels = img.load()
     
@@ -467,10 +660,9 @@ def render_multicolor_bitmap_mode(vic, bitmap_mem, screen_mem, color_mem):
         for char_col in range(40):
             screen_pos = char_row * 40 + char_col
             color_byte = screen_mem[screen_pos]
-            color1 = (color_byte >> 4) & 0x0F  # Upper nibble
-            color2 = color_byte & 0x0F          # Lower nibble
+            color1 = (color_byte >> 4) & 0x0F
+            color2 = color_byte & 0x0F
             color3 = color_mem[screen_pos] & 0x0F
-            
             bitmap_offset = char_row * 40 * 8 + char_col * 8
             
             for y in range(8):
@@ -483,17 +675,15 @@ def render_multicolor_bitmap_mode(vic, bitmap_mem, screen_mem, color_mem):
                         c = C64_PALETTE[color1]
                     elif bits == 2:
                         c = C64_PALETTE[color2]
-                    else:  # bits == 3
+                    else:
                         c = C64_PALETTE[color3]
                     pixels[char_col * 4 + x, char_row * 8 + y] = c
     
-    # Resize to 320x200 to maintain aspect ratio
     img = img.resize((320, 200), Image.NEAREST)
     return img
 
 
 def render_ecm_mode(vic, screen_mem, color_mem, char_rom):
-    """Render Extended Color Mode (ECM)"""
     img = Image.new('RGB', (320, 200), C64_PALETTE[vic.background_color])
     pixels = img.load()
     
@@ -508,11 +698,10 @@ def render_ecm_mode(vic, screen_mem, color_mem, char_rom):
         for col in range(40):
             screen_pos = row * 40 + col
             screen_byte = screen_mem[screen_pos]
-            char_code = screen_byte & 0x3F  # Only lower 6 bits for character
-            bg_select = (screen_byte >> 6) & 0x03  # Upper 2 bits select background
+            char_code = screen_byte & 0x3F
+            bg_select = (screen_byte >> 6) & 0x03
             color_idx = color_mem[screen_pos] & 0x0F
             bg_color = bg_colors[bg_select]
-            
             char_offset = char_code * 8
             
             for y in range(8):
@@ -522,21 +711,13 @@ def render_ecm_mode(vic, screen_mem, color_mem, char_rom):
                         pixels[col * 8 + x, row * 8 + y] = C64_PALETTE[color_idx]
                     else:
                         pixels[col * 8 + x, row * 8 + y] = C64_PALETTE[bg_color]
-    
     return img
 
 
 def apply_rsel_csel_blanking(img, vic):
-    """
-    Apply RSEL/CSEL blanking to match actual visible display.
-    
-    RSEL=0: 24 rows - YSCROLL determines if top or bottom 8px blanked
-    CSEL=0: 38 cols - XSCROLL determines if left or right 8px blanked
-    """
     if vic.rsel == 1 and vic.csel == 1:
         return img
     
-    from PIL import ImageDraw
     result = img.copy()
     draw = ImageDraw.Draw(result)
     border = C64_PALETTE[vic.border_color]
@@ -558,7 +739,6 @@ def apply_rsel_csel_blanking(img, vic):
 
 
 def add_border(img, border_color, border_size=32):
-    """Add a border around the screen image"""
     w, h = img.size
     new_w = w + border_size * 2
     new_h = h + border_size * 2
@@ -567,224 +747,10 @@ def add_border(img, border_color, border_size=32):
     return bordered
 
 
-def capture_screenshot(ip_address, output_file="screenshot.png", add_border_flag=True, 
-                       password=None, include_sprites=False, upscale=1):
-    """Main function to capture a screenshot from the Ultimate 64"""
-    
-    api = Ultimate64API(ip_address, password)
-    
-    print(f"Connecting to Ultimate 64 at {ip_address}...")
-    
-    # Step 1: Pause/freeze the machine
-    print("Freezing machine...")
-    if not api.pause():
-        print("Warning: Failed to pause machine (may already be paused)")
-    
-    try:
-        # Step 2: Read VIC-II registers ($D000-$D02F)
-        print("Reading VIC-II registers...")
-        vic_regs = api.read_memory(0xD000, 0x30)
-        if vic_regs is None:
-            print("Error: Failed to read VIC-II registers")
-            return False
-        
-        # Save VIC registers for debugging
-        with open("vic_regs.bin", "wb") as f:
-            f.write(vic_regs)
-        print("  Saved VIC registers to vic_regs.bin")
-        
-        # Step 3: Read CIA2 data port for VIC bank selection
-        print("Reading CIA2 for VIC bank selection...")
-        cia2_data = api.read_memory(0xDD00, 1)
-        if cia2_data is None:
-            print("Error: Failed to read CIA2")
-            return False
-        
-        # Create VIC state object
-        vic = VICIIState(vic_regs, cia2_data[0])
-        vic.dump_info()
-        
-        # Step 4: Read color RAM ($D800-$DBE7, 1000 bytes)
-        print("Reading Color RAM...")
-        color_mem = api.read_memory(0xD800, 1000)
-        if color_mem is None:
-            print("Error: Failed to read color RAM")
-            return False
-        with open("color_mem.bin", "wb") as f:
-            f.write(color_mem)
-        print("  Saved color memory to color_mem.bin")
-        
-        # Step 5: Read screen memory (1024 bytes to include sprite pointers at end)
-        # Use banked read in case screen memory overlaps with ROM areas
-        print(f"Reading Screen Memory at ${vic.screen_mem_addr:04X}...")
-        screen_mem = api.read_memory_with_rom_warning(vic.screen_mem_addr, 1024)
-        if screen_mem is None:
-            print("Error: Failed to read screen memory")
-            return False
-        with open("screen_mem.bin", "wb") as f:
-            f.write(screen_mem)
-        print("  Saved screen memory to screen_mem.bin")
-        
-        # Step 6: Read character ROM or bitmap data depending on mode
-        if vic.bmm:
-            # Bitmap mode - read 8000 bytes of bitmap data
-            # Use banked read in case bitmap overlaps with ROM areas (e.g. VIC bank 3)
-            print(f"Reading Bitmap Memory at ${vic.bitmap_mem_addr:04X}...")
-            bitmap_mem = api.read_memory_with_rom_warning(vic.bitmap_mem_addr, 8000)
-            if bitmap_mem is None:
-                print("Error: Failed to read bitmap memory")
-                return False
-            with open("bitmap_mem.bin", "wb") as f:
-                f.write(bitmap_mem)
-            print("  Saved bitmap memory to bitmap_mem.bin")
-            char_rom = None
-        else:
-            # Text mode - we need character data
-            # Character ROM is at $D000-$DFFF when accessed by CPU with certain bank configs
-            # But VIC sees it differently. For VIC banks 0 and 2, addresses $1000-$1FFF and $9000-$9FFF
-            # see the character ROM instead of RAM.
-            
-            # Check if char memory points to ROM area
-            char_addr_in_bank = vic.char_mem_offset
-            uses_char_rom = False
-            
-            if vic.vic_bank == 0x0000 or vic.vic_bank == 0x8000:
-                # Banks 0 and 2 have char ROM at offset $1000-$1FFF
-                if char_addr_in_bank >= 0x1000 and char_addr_in_bank < 0x2000:
-                    uses_char_rom = True
-            
-            if uses_char_rom:
-                print("Reading Character ROM...")
-                # DMA reads see RAM, not ROM, so we use embedded charset
-                print("  Using embedded C64 character ROM")
-                char_rom = get_embedded_charset()
-            else:
-                print(f"Reading Character Memory at ${vic.char_mem_addr:04X}...")
-                # Use banked read in case chars are in ROM-shadowed area
-                char_rom = api.read_memory_with_rom_warning(vic.char_mem_addr, 2048)
-                if char_rom is None:
-                    print("Error: Failed to read character memory")
-                    return False
-                with open("char_mem.bin", "wb") as f:
-                    f.write(char_rom)
-                print("  Saved character memory to char_mem.bin")
-            
-            bitmap_mem = None
-        
-        # Step 7: Render the screen based on mode
-        print("Rendering screen...")
-        
-        if vic.bmm and vic.mcm:
-            # Multicolor bitmap mode
-            img = render_multicolor_bitmap_mode(vic, bitmap_mem, screen_mem, color_mem)
-        elif vic.bmm and not vic.mcm:
-            # Hi-res bitmap mode
-            img = render_hires_bitmap_mode(vic, bitmap_mem, screen_mem)
-        elif vic.ecm:
-            # Extended color mode
-            img = render_ecm_mode(vic, screen_mem, color_mem, char_rom)
-        elif vic.mcm:
-            # Multicolor text mode
-            img = render_multicolor_text_mode(vic, screen_mem, color_mem, char_rom)
-        else:
-            # Standard text mode
-            img = render_standard_text_mode(vic, screen_mem, color_mem, char_rom)
-        
-        # Step 7.5: Overlay sprites if requested
-        if include_sprites:
-            print("Processing sprites...")
-            
-            # Sprite pointers are at screen memory + $3F8 (last 8 bytes of 1K screen area)
-            sprite_pointers = screen_mem[0x3F8:0x400]
-            
-            # Get sprite info
-            sprites = get_sprite_info(vic_regs, sprite_pointers, vic.vic_bank)
-            
-            # Print sprite information
-            enabled_count = 0
-            for sprite in sprites:
-                if sprite.enabled:
-                    print(f"  {sprite}")
-                    enabled_count += 1
-            
-            if enabled_count == 0:
-                print("  No sprites enabled")
-            else:
-                print(f"  {enabled_count} sprite(s) enabled")
-            
-            # Read sprite data for each enabled sprite
-            sprite_data_list = []
-            for sprite in sprites:
-                if sprite.enabled:
-                    # Read 64 bytes of sprite data (63 used + 1 padding)
-                    data = api.read_memory(sprite.data_addr, 64)
-                    sprite_data_list.append(data)
-                    
-                    # Save sprite data for debugging
-                    if data:
-                        with open(f"sprite{sprite.num}_data.bin", "wb") as f:
-                            f.write(data)
-                else:
-                    sprite_data_list.append(None)
-            
-            # First overlay sprites that are behind the screen (priority=1)
-            # These should be rendered but partially obscured by screen content
-            # For simplicity, we'll render behind sprites first, then screen, then front sprites
-            # But since screen is already rendered, we just overlay front sprites
-            
-            # Overlay sprites that are in front (priority=0)
-            img = overlay_sprites(img, sprites, sprite_data_list, vic, front_only=False)
-        
-        # Step 7.6: Apply RSEL/CSEL blanking to match actual visible display
-        if vic.rsel == 0 or vic.csel == 0:
-            blanking_info = []
-            if vic.rsel == 0:
-                if vic.yscroll >= 4:
-                    blanking_info.append(f"24 rows, YSCROLL={vic.yscroll} (bottom 8px blanked)")
-                else:
-                    blanking_info.append(f"24 rows, YSCROLL={vic.yscroll} (top 8px blanked)")
-            if vic.csel == 0:
-                if vic.xscroll >= 4:
-                    blanking_info.append(f"38 cols, XSCROLL={vic.xscroll} (right 8px blanked)")
-                else:
-                    blanking_info.append(f"38 cols, XSCROLL={vic.xscroll} (left 8px blanked)")
-            print(f"Applying display blanking: {', '.join(blanking_info)}")
-            img = apply_rsel_csel_blanking(img, vic)
-        
-        # Step 8: Add border if requested
-        if add_border_flag:
-            img = add_border(img, vic.border_color)
-        
-        # Step 9: Upscale if requested
-        if upscale > 1:
-            new_width = img.width * upscale
-            new_height = img.height * upscale
-            img = img.resize((new_width, new_height), Image.NEAREST)
-            print(f"Upscaled to {new_width}x{new_height} ({upscale}x)")
-        
-        # Step 10: Save the image
-        img.save(output_file)
-        print(f"Screenshot saved to {output_file}")
-        
-        return True
-        
-    finally:
-        # Step 10: Resume the machine
-        print("Resuming machine...")
-        if api.resume():
-            print("Machine resumed successfully")
-        else:
-            print("Warning: Failed to resume machine")
-
-
 def get_embedded_charset():
     """Return the standard C64 character ROM (uppercase/graphics set)"""
-    # Complete C64 character set - 256 screen codes, 8 bytes each
-    # Each entry is [row0, row1, row2, row3, row4, row5, row6, row7]
     chars = {
-        # Screen code 0: @
         0: [0x3C, 0x66, 0x6E, 0x6E, 0x60, 0x62, 0x3C, 0x00],
-        # Screen codes 1-26: A-Z
         1: [0x18, 0x3C, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00],
         2: [0x7C, 0x66, 0x66, 0x7C, 0x66, 0x66, 0x7C, 0x00],
         3: [0x3C, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3C, 0x00],
@@ -811,114 +777,109 @@ def get_embedded_charset():
         24: [0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00],
         25: [0x66, 0x66, 0x66, 0x3C, 0x18, 0x18, 0x18, 0x00],
         26: [0x7E, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x7E, 0x00],
-        # Screen codes 27-31: special chars
-        27: [0x3C, 0x30, 0x30, 0x30, 0x30, 0x30, 0x3C, 0x00],  # [
-        28: [0x0C, 0x12, 0x30, 0x7C, 0x30, 0x62, 0xFC, 0x00],  # pound
-        29: [0x3C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x3C, 0x00],  # ]
-        30: [0x00, 0x08, 0x1C, 0x3E, 0x08, 0x08, 0x00, 0x00],  # up arrow
-        31: [0x00, 0x10, 0x30, 0x7F, 0x30, 0x10, 0x00, 0x00],  # left arrow
-        # Screen codes 32-63: punctuation and numbers
-        32: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],  # space
-        33: [0x18, 0x18, 0x18, 0x18, 0x00, 0x00, 0x18, 0x00],  # !
-        34: [0x66, 0x66, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00],  # "
-        35: [0x66, 0x66, 0xFF, 0x66, 0xFF, 0x66, 0x66, 0x00],  # #
-        36: [0x18, 0x3E, 0x60, 0x3C, 0x06, 0x7C, 0x18, 0x00],  # $
-        37: [0x62, 0x66, 0x0C, 0x18, 0x30, 0x66, 0x46, 0x00],  # %
-        38: [0x3C, 0x66, 0x3C, 0x38, 0x67, 0x66, 0x3F, 0x00],  # &
-        39: [0x06, 0x0C, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00],  # '
-        40: [0x0C, 0x18, 0x30, 0x30, 0x30, 0x18, 0x0C, 0x00],  # (
-        41: [0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x18, 0x30, 0x00],  # )
-        42: [0x00, 0x66, 0x3C, 0xFF, 0x3C, 0x66, 0x00, 0x00],  # *
-        43: [0x00, 0x18, 0x18, 0x7E, 0x18, 0x18, 0x00, 0x00],  # +
-        44: [0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x30],  # ,
-        45: [0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00],  # -
-        46: [0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00],  # .
-        47: [0x00, 0x03, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x00],  # /
-        48: [0x3C, 0x66, 0x6E, 0x76, 0x66, 0x66, 0x3C, 0x00],  # 0
-        49: [0x18, 0x18, 0x38, 0x18, 0x18, 0x18, 0x7E, 0x00],  # 1
-        50: [0x3C, 0x66, 0x06, 0x0C, 0x30, 0x60, 0x7E, 0x00],  # 2
-        51: [0x3C, 0x66, 0x06, 0x1C, 0x06, 0x66, 0x3C, 0x00],  # 3
-        52: [0x06, 0x0E, 0x1E, 0x66, 0x7F, 0x06, 0x06, 0x00],  # 4
-        53: [0x7E, 0x60, 0x7C, 0x06, 0x06, 0x66, 0x3C, 0x00],  # 5
-        54: [0x3C, 0x66, 0x60, 0x7C, 0x66, 0x66, 0x3C, 0x00],  # 6
-        55: [0x7E, 0x66, 0x0C, 0x18, 0x18, 0x18, 0x18, 0x00],  # 7
-        56: [0x3C, 0x66, 0x66, 0x3C, 0x66, 0x66, 0x3C, 0x00],  # 8
-        57: [0x3C, 0x66, 0x66, 0x3E, 0x06, 0x66, 0x3C, 0x00],  # 9
-        58: [0x00, 0x00, 0x18, 0x00, 0x00, 0x18, 0x00, 0x00],  # :
-        59: [0x00, 0x00, 0x18, 0x00, 0x00, 0x18, 0x18, 0x30],  # ;
-        60: [0x0E, 0x18, 0x30, 0x60, 0x30, 0x18, 0x0E, 0x00],  # <
-        61: [0x00, 0x00, 0x7E, 0x00, 0x7E, 0x00, 0x00, 0x00],  # =
-        62: [0x70, 0x18, 0x0C, 0x06, 0x0C, 0x18, 0x70, 0x00],  # >
-        63: [0x3C, 0x66, 0x06, 0x0C, 0x18, 0x00, 0x18, 0x00],  # ?
-        # Screen codes 64-95: PETSCII graphics
-        64: [0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00],  # horizontal bar
-        65: [0x08, 0x1C, 0x3E, 0x7F, 0x7F, 0x1C, 0x3E, 0x00],  # spade
-        66: [0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18],  # vertical line
-        67: [0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF],  # lower half
-        68: [0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00],  # upper half
-        69: [0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0],  # left half
-        70: [0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA],  # checkerboard
-        71: [0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F],  # right half
-        72: [0x00, 0x00, 0x00, 0x00, 0xAA, 0x55, 0xAA, 0x55],  # lower checker
-        73: [0x0F, 0x07, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00],  # corner TR
-        74: [0x55, 0xAA, 0x55, 0xAA, 0x00, 0x00, 0x00, 0x00],  # upper checker
-        75: [0x00, 0x00, 0x00, 0x00, 0x01, 0x03, 0x07, 0x0F],  # corner BR
-        76: [0x00, 0x00, 0x00, 0x00, 0x80, 0xC0, 0xE0, 0xF0],  # corner BL
-        77: [0xF0, 0xE0, 0xC0, 0x80, 0x00, 0x00, 0x00, 0x00],  # corner TL
-        78: [0x01, 0x03, 0x07, 0x0F, 0x1F, 0x3F, 0x7F, 0xFF],  # diagonal BR
-        79: [0x80, 0xC0, 0xE0, 0xF0, 0xF8, 0xFC, 0xFE, 0xFF],  # diagonal BL
-        80: [0xFF, 0xFE, 0xFC, 0xF8, 0xF0, 0xE0, 0xC0, 0x80],  # diagonal TL
-        81: [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],  # solid block
-        82: [0xFF, 0x7F, 0x3F, 0x1F, 0x0F, 0x07, 0x03, 0x01],  # diagonal TR
-        83: [0x3C, 0x7E, 0xFF, 0xFF, 0xFF, 0xFF, 0x7E, 0x3C],  # circle filled
-        84: [0xC0, 0xC0, 0xC0, 0xC0, 0xC0, 0xC0, 0xC0, 0xC0],  # left bar
-        85: [0x18, 0x18, 0x7E, 0xFF, 0xFF, 0x18, 0x3C, 0x00],  # club
-        86: [0x00, 0x00, 0x00, 0x00, 0xF0, 0xF0, 0xF0, 0xF0],  # lower left quarter
-        87: [0x0F, 0x0F, 0x0F, 0x0F, 0x00, 0x00, 0x00, 0x00],  # upper right quarter
-        88: [0x00, 0x00, 0x00, 0x00, 0x0F, 0x0F, 0x0F, 0x0F],  # lower right quarter
-        89: [0xF8, 0xF0, 0xE0, 0xC0, 0x80, 0x00, 0x00, 0x00],  # arc TL-BR
-        90: [0xF0, 0xF0, 0xF0, 0xF0, 0x00, 0x00, 0x00, 0x00],  # upper left quarter
-        91: [0x00, 0x66, 0xFF, 0xFF, 0xFF, 0x7E, 0x3C, 0x18],  # heart
-        92: [0x00, 0x00, 0x00, 0x80, 0xC0, 0xE0, 0xF0, 0xF8],  # arc TR-BL
-        93: [0x18, 0x18, 0x18, 0xFF, 0xFF, 0x18, 0x18, 0x18],  # cross
-        94: [0x00, 0x3C, 0x42, 0x42, 0x42, 0x42, 0x3C, 0x00],  # circle outline
-        95: [0x18, 0x3C, 0x7E, 0xFF, 0x7E, 0x3C, 0x18, 0x00],  # diamond
-        # Screen codes 96-127: more PETSCII graphics
-        96: [0x00, 0x00, 0x00, 0x01, 0x03, 0x07, 0x0F, 0x1F],  # arc BL-TR
-        97: [0x1F, 0x0F, 0x07, 0x03, 0x01, 0x00, 0x00, 0x00],  # arc TL-BR
-        98: [0x00, 0x00, 0x7F, 0x36, 0x36, 0x36, 0x63, 0x00],  # pi
-        99: [0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF],  # bottom with line
-        100: [0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03], # right bar thin
-        101: [0xC0, 0x60, 0x30, 0x18, 0x0C, 0x06, 0x03, 0x01], # diagonal TL-BR
-        102: [0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA], # vertical lines
-        103: [0x01, 0x03, 0x06, 0x0C, 0x18, 0x30, 0x60, 0xC0], # diagonal BL-TR
-        104: [0x00, 0x00, 0x00, 0x00, 0xC0, 0xC0, 0xC0, 0xC0], # bottom left box
-        105: [0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00], # horizontal lines
-        106: [0x00, 0x00, 0x00, 0x00, 0x03, 0x03, 0x03, 0x03], # bottom right box
-        107: [0xC0, 0xC0, 0xC0, 0xC0, 0x00, 0x00, 0x00, 0x00], # top left box
-        108: [0x03, 0x03, 0x03, 0x03, 0x00, 0x00, 0x00, 0x00], # top right box
-        109: [0x00, 0x00, 0x00, 0xFF, 0xFF, 0x18, 0x18, 0x18], # T down
-        110: [0x18, 0x18, 0x18, 0xFF, 0xFF, 0x00, 0x00, 0x00], # T up
-        111: [0x18, 0x18, 0x18, 0x1F, 0x1F, 0x18, 0x18, 0x18], # T right
-        112: [0x18, 0x18, 0x18, 0xF8, 0xF8, 0x00, 0x00, 0x00], # corner BL
-        113: [0x00, 0x00, 0x00, 0xF8, 0xF8, 0x18, 0x18, 0x18], # corner TL
-        114: [0x00, 0x00, 0x00, 0x1F, 0x1F, 0x18, 0x18, 0x18], # corner TR
-        115: [0x18, 0x18, 0x18, 0x1F, 0x1F, 0x00, 0x00, 0x00], # corner BR
-        116: [0x18, 0x18, 0x18, 0xF8, 0xF8, 0x18, 0x18, 0x18], # T left
-        117: [0x18, 0x18, 0x18, 0xFF, 0xFF, 0x18, 0x18, 0x18], # cross junction
-        118: [0x3C, 0x3C, 0x3C, 0x3C, 0x3C, 0x3C, 0x3C, 0x3C], # thick vertical
-        119: [0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00], # thick horizontal
-        120: [0x00, 0x00, 0x00, 0x00, 0x3C, 0x3C, 0x3C, 0x3C], # lower thick
-        121: [0x3C, 0x3C, 0x3C, 0x3C, 0x00, 0x00, 0x00, 0x00], # upper thick
-        122: [0x00, 0x00, 0x00, 0x00, 0x3C, 0x3C, 0x3C, 0x3C], # lower thick alt
-        123: [0x3C, 0x3C, 0x3C, 0x3C, 0x00, 0x00, 0x00, 0x00], # upper thick alt
-        124: [0x00, 0x00, 0xFC, 0xFC, 0x3C, 0x3C, 0x3C, 0x3C], # thick TL
-        125: [0x3C, 0x3C, 0x3C, 0x3C, 0x3F, 0x3F, 0x00, 0x00], # thick BR
-        126: [0x00, 0x7E, 0x66, 0x66, 0x66, 0x66, 0x00, 0x00], # pi variant
-        127: [0x08, 0x1C, 0x3E, 0x7F, 0x3E, 0x1C, 0x08, 0x00], # filled triangle
+        27: [0x3C, 0x30, 0x30, 0x30, 0x30, 0x30, 0x3C, 0x00],
+        28: [0x0C, 0x12, 0x30, 0x7C, 0x30, 0x62, 0xFC, 0x00],
+        29: [0x3C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x3C, 0x00],
+        30: [0x00, 0x08, 0x1C, 0x3E, 0x08, 0x08, 0x00, 0x00],
+        31: [0x00, 0x10, 0x30, 0x7F, 0x30, 0x10, 0x00, 0x00],
+        32: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        33: [0x18, 0x18, 0x18, 0x18, 0x00, 0x00, 0x18, 0x00],
+        34: [0x66, 0x66, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00],
+        35: [0x66, 0x66, 0xFF, 0x66, 0xFF, 0x66, 0x66, 0x00],
+        36: [0x18, 0x3E, 0x60, 0x3C, 0x06, 0x7C, 0x18, 0x00],
+        37: [0x62, 0x66, 0x0C, 0x18, 0x30, 0x66, 0x46, 0x00],
+        38: [0x3C, 0x66, 0x3C, 0x38, 0x67, 0x66, 0x3F, 0x00],
+        39: [0x06, 0x0C, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00],
+        40: [0x0C, 0x18, 0x30, 0x30, 0x30, 0x18, 0x0C, 0x00],
+        41: [0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x18, 0x30, 0x00],
+        42: [0x00, 0x66, 0x3C, 0xFF, 0x3C, 0x66, 0x00, 0x00],
+        43: [0x00, 0x18, 0x18, 0x7E, 0x18, 0x18, 0x00, 0x00],
+        44: [0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x30],
+        45: [0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00],
+        46: [0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00],
+        47: [0x00, 0x03, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x00],
+        48: [0x3C, 0x66, 0x6E, 0x76, 0x66, 0x66, 0x3C, 0x00],
+        49: [0x18, 0x18, 0x38, 0x18, 0x18, 0x18, 0x7E, 0x00],
+        50: [0x3C, 0x66, 0x06, 0x0C, 0x30, 0x60, 0x7E, 0x00],
+        51: [0x3C, 0x66, 0x06, 0x1C, 0x06, 0x66, 0x3C, 0x00],
+        52: [0x06, 0x0E, 0x1E, 0x66, 0x7F, 0x06, 0x06, 0x00],
+        53: [0x7E, 0x60, 0x7C, 0x06, 0x06, 0x66, 0x3C, 0x00],
+        54: [0x3C, 0x66, 0x60, 0x7C, 0x66, 0x66, 0x3C, 0x00],
+        55: [0x7E, 0x66, 0x0C, 0x18, 0x18, 0x18, 0x18, 0x00],
+        56: [0x3C, 0x66, 0x66, 0x3C, 0x66, 0x66, 0x3C, 0x00],
+        57: [0x3C, 0x66, 0x66, 0x3E, 0x06, 0x66, 0x3C, 0x00],
+        58: [0x00, 0x00, 0x18, 0x00, 0x00, 0x18, 0x00, 0x00],
+        59: [0x00, 0x00, 0x18, 0x00, 0x00, 0x18, 0x18, 0x30],
+        60: [0x0E, 0x18, 0x30, 0x60, 0x30, 0x18, 0x0E, 0x00],
+        61: [0x00, 0x00, 0x7E, 0x00, 0x7E, 0x00, 0x00, 0x00],
+        62: [0x70, 0x18, 0x0C, 0x06, 0x0C, 0x18, 0x70, 0x00],
+        63: [0x3C, 0x66, 0x06, 0x0C, 0x18, 0x00, 0x18, 0x00],
+        64: [0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00],
+        65: [0x08, 0x1C, 0x3E, 0x7F, 0x7F, 0x1C, 0x3E, 0x00],
+        66: [0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18],
+        67: [0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF],
+        68: [0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00],
+        69: [0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0],
+        70: [0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA],
+        71: [0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F],
+        72: [0x00, 0x00, 0x00, 0x00, 0xAA, 0x55, 0xAA, 0x55],
+        73: [0x0F, 0x07, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00],
+        74: [0x55, 0xAA, 0x55, 0xAA, 0x00, 0x00, 0x00, 0x00],
+        75: [0x00, 0x00, 0x00, 0x00, 0x01, 0x03, 0x07, 0x0F],
+        76: [0x00, 0x00, 0x00, 0x00, 0x80, 0xC0, 0xE0, 0xF0],
+        77: [0xF0, 0xE0, 0xC0, 0x80, 0x00, 0x00, 0x00, 0x00],
+        78: [0x01, 0x03, 0x07, 0x0F, 0x1F, 0x3F, 0x7F, 0xFF],
+        79: [0x80, 0xC0, 0xE0, 0xF0, 0xF8, 0xFC, 0xFE, 0xFF],
+        80: [0xFF, 0xFE, 0xFC, 0xF8, 0xF0, 0xE0, 0xC0, 0x80],
+        81: [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+        82: [0xFF, 0x7F, 0x3F, 0x1F, 0x0F, 0x07, 0x03, 0x01],
+        83: [0x3C, 0x7E, 0xFF, 0xFF, 0xFF, 0xFF, 0x7E, 0x3C],
+        84: [0xC0, 0xC0, 0xC0, 0xC0, 0xC0, 0xC0, 0xC0, 0xC0],
+        85: [0x18, 0x18, 0x7E, 0xFF, 0xFF, 0x18, 0x3C, 0x00],
+        86: [0x00, 0x00, 0x00, 0x00, 0xF0, 0xF0, 0xF0, 0xF0],
+        87: [0x0F, 0x0F, 0x0F, 0x0F, 0x00, 0x00, 0x00, 0x00],
+        88: [0x00, 0x00, 0x00, 0x00, 0x0F, 0x0F, 0x0F, 0x0F],
+        89: [0xF8, 0xF0, 0xE0, 0xC0, 0x80, 0x00, 0x00, 0x00],
+        90: [0xF0, 0xF0, 0xF0, 0xF0, 0x00, 0x00, 0x00, 0x00],
+        91: [0x00, 0x66, 0xFF, 0xFF, 0xFF, 0x7E, 0x3C, 0x18],
+        92: [0x00, 0x00, 0x00, 0x80, 0xC0, 0xE0, 0xF0, 0xF8],
+        93: [0x18, 0x18, 0x18, 0xFF, 0xFF, 0x18, 0x18, 0x18],
+        94: [0x00, 0x3C, 0x42, 0x42, 0x42, 0x42, 0x3C, 0x00],
+        95: [0x18, 0x3C, 0x7E, 0xFF, 0x7E, 0x3C, 0x18, 0x00],
+        96: [0x00, 0x00, 0x00, 0x01, 0x03, 0x07, 0x0F, 0x1F],
+        97: [0x1F, 0x0F, 0x07, 0x03, 0x01, 0x00, 0x00, 0x00],
+        98: [0x00, 0x00, 0x7F, 0x36, 0x36, 0x36, 0x63, 0x00],
+        99: [0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF],
+        100: [0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03],
+        101: [0xC0, 0x60, 0x30, 0x18, 0x0C, 0x06, 0x03, 0x01],
+        102: [0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA],
+        103: [0x01, 0x03, 0x06, 0x0C, 0x18, 0x30, 0x60, 0xC0],
+        104: [0x00, 0x00, 0x00, 0x00, 0xC0, 0xC0, 0xC0, 0xC0],
+        105: [0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00],
+        106: [0x00, 0x00, 0x00, 0x00, 0x03, 0x03, 0x03, 0x03],
+        107: [0xC0, 0xC0, 0xC0, 0xC0, 0x00, 0x00, 0x00, 0x00],
+        108: [0x03, 0x03, 0x03, 0x03, 0x00, 0x00, 0x00, 0x00],
+        109: [0x00, 0x00, 0x00, 0xFF, 0xFF, 0x18, 0x18, 0x18],
+        110: [0x18, 0x18, 0x18, 0xFF, 0xFF, 0x00, 0x00, 0x00],
+        111: [0x18, 0x18, 0x18, 0x1F, 0x1F, 0x18, 0x18, 0x18],
+        112: [0x18, 0x18, 0x18, 0xF8, 0xF8, 0x00, 0x00, 0x00],
+        113: [0x00, 0x00, 0x00, 0xF8, 0xF8, 0x18, 0x18, 0x18],
+        114: [0x00, 0x00, 0x00, 0x1F, 0x1F, 0x18, 0x18, 0x18],
+        115: [0x18, 0x18, 0x18, 0x1F, 0x1F, 0x00, 0x00, 0x00],
+        116: [0x18, 0x18, 0x18, 0xF8, 0xF8, 0x18, 0x18, 0x18],
+        117: [0x18, 0x18, 0x18, 0xFF, 0xFF, 0x18, 0x18, 0x18],
+        118: [0x3C, 0x3C, 0x3C, 0x3C, 0x3C, 0x3C, 0x3C, 0x3C],
+        119: [0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00],
+        120: [0x00, 0x00, 0x00, 0x00, 0x3C, 0x3C, 0x3C, 0x3C],
+        121: [0x3C, 0x3C, 0x3C, 0x3C, 0x00, 0x00, 0x00, 0x00],
+        122: [0x00, 0x00, 0x00, 0x00, 0x3C, 0x3C, 0x3C, 0x3C],
+        123: [0x3C, 0x3C, 0x3C, 0x3C, 0x00, 0x00, 0x00, 0x00],
+        124: [0x00, 0x00, 0xFC, 0xFC, 0x3C, 0x3C, 0x3C, 0x3C],
+        125: [0x3C, 0x3C, 0x3C, 0x3C, 0x3F, 0x3F, 0x00, 0x00],
+        126: [0x00, 0x7E, 0x66, 0x66, 0x66, 0x66, 0x00, 0x00],
+        127: [0x08, 0x1C, 0x3E, 0x7F, 0x3E, 0x1C, 0x08, 0x00],
     }
     
-    # Build the 2048-byte charset
     charset = bytearray(2048)
     for code, pattern in chars.items():
         if code < 128:
@@ -926,16 +887,175 @@ def get_embedded_charset():
             for i, byte in enumerate(pattern):
                 charset[offset + i] = byte
     
-    # Screen codes 128-255: copy of 0-127 (reverse video handled in rendering)
     for i in range(1024):
         charset[1024 + i] = charset[i]
     
     return bytes(charset)
 
 
+def capture_screenshot(ip_address, output_file="screenshot.png", add_border_flag=True, 
+                       password=None, include_sprites=True, upscale=1, use_rom_bypass=True):
+    """Main function to capture a screenshot from the Ultimate 64"""
+    
+    api = Ultimate64API(ip_address, password)
+    
+    print(f"Connecting to Ultimate 64 at {ip_address}...")
+    print(f"ROM bypass mode: {'ENABLED' if use_rom_bypass else 'disabled'}")
+    
+    print("Freezing machine...")
+    if not api.pause():
+        print("Warning: Failed to pause machine (may already be paused)")
+    
+    try:
+        print("Reading VIC-II registers...")
+        vic_regs = api.read_memory(0xD000, 0x30)
+        if vic_regs is None:
+            print("Error: Failed to read VIC-II registers")
+            return False
+        
+        print("Reading CIA2 for VIC bank selection...")
+        cia2_data = api.read_memory(0xDD00, 1)
+        if cia2_data is None:
+            print("Error: Failed to read CIA2")
+            return False
+        
+        vic = VICIIState(vic_regs, cia2_data[0])
+        vic.dump_info()
+        
+        print("Reading Color RAM...")
+        color_mem = api.read_memory(0xD800, 1000)
+        if color_mem is None:
+            print("Error: Failed to read color RAM")
+            return False
+        
+        # Read screen memory - use smart read if ROM bypass enabled
+        print(f"Reading Screen Memory at ${vic.screen_mem_addr:04X}...")
+        if use_rom_bypass:
+            screen_mem = read_memory_smart(api, vic.screen_mem_addr, 1024, vic)
+        else:
+            screen_mem = api.read_memory(vic.screen_mem_addr, 1024)
+        
+        if screen_mem is None:
+            print("Error: Failed to read screen memory")
+            return False
+        
+        if vic.bmm:
+            print(f"Reading Bitmap Memory at ${vic.bitmap_mem_addr:04X}...")
+            if use_rom_bypass:
+                bitmap_mem = read_memory_smart(api, vic.bitmap_mem_addr, 8000, vic)
+            else:
+                bitmap_mem = api.read_memory(vic.bitmap_mem_addr, 8000)
+            
+            if bitmap_mem is None:
+                print("Error: Failed to read bitmap memory")
+                return False
+            char_rom = None
+        else:
+            char_addr_in_bank = vic.char_mem_offset
+            uses_char_rom = False
+            
+            if vic.vic_bank == 0x0000 or vic.vic_bank == 0x8000:
+                if char_addr_in_bank >= 0x1000 and char_addr_in_bank < 0x2000:
+                    uses_char_rom = True
+            
+            if uses_char_rom:
+                print("Reading Character ROM...")
+                print("  Using embedded C64 character ROM")
+                char_rom = get_embedded_charset()
+            else:
+                print(f"Reading Character Memory at ${vic.char_mem_addr:04X}...")
+                if use_rom_bypass:
+                    char_rom = read_memory_smart(api, vic.char_mem_addr, 2048, vic)
+                else:
+                    char_rom = api.read_memory(vic.char_mem_addr, 2048)
+                
+                if char_rom is None:
+                    print("Error: Failed to read character memory")
+                    return False
+            
+            bitmap_mem = None
+        
+        print("Rendering screen...")
+        
+        if vic.bmm and vic.mcm:
+            img = render_multicolor_bitmap_mode(vic, bitmap_mem, screen_mem, color_mem)
+        elif vic.bmm and not vic.mcm:
+            img = render_hires_bitmap_mode(vic, bitmap_mem, screen_mem)
+        elif vic.ecm:
+            img = render_ecm_mode(vic, screen_mem, color_mem, char_rom)
+        elif vic.mcm:
+            img = render_multicolor_text_mode(vic, screen_mem, color_mem, char_rom)
+        else:
+            img = render_standard_text_mode(vic, screen_mem, color_mem, char_rom)
+        
+        if include_sprites:
+            print("Processing sprites...")
+            sprite_pointers = screen_mem[0x3F8:0x400]
+            sprites = get_sprite_info(vic_regs, sprite_pointers, vic.vic_bank)
+            
+            enabled_count = 0
+            for sprite in sprites:
+                if sprite.enabled:
+                    print(f"  {sprite}")
+                    enabled_count += 1
+            
+            if enabled_count == 0:
+                print("  No sprites enabled")
+            else:
+                print(f"  {enabled_count} sprite(s) enabled")
+            
+            sprite_data_list = []
+            for sprite in sprites:
+                if sprite.enabled:
+                    data = api.read_memory(sprite.data_addr, 64)
+                    sprite_data_list.append(data)
+                else:
+                    sprite_data_list.append(None)
+            
+            img = overlay_sprites(img, sprites, sprite_data_list, vic, front_only=False)
+        
+        if vic.rsel == 0 or vic.csel == 0:
+            blanking_info = []
+            if vic.rsel == 0:
+                if vic.yscroll >= 4:
+                    blanking_info.append(f"24 rows, YSCROLL={vic.yscroll} (bottom 8px blanked)")
+                else:
+                    blanking_info.append(f"24 rows, YSCROLL={vic.yscroll} (top 8px blanked)")
+            if vic.csel == 0:
+                if vic.xscroll >= 4:
+                    blanking_info.append(f"38 cols, XSCROLL={vic.xscroll} (right 8px blanked)")
+                else:
+                    blanking_info.append(f"38 cols, XSCROLL={vic.xscroll} (left 8px blanked)")
+            print(f"Applying display blanking: {', '.join(blanking_info)}")
+            img = apply_rsel_csel_blanking(img, vic)
+        
+        if add_border_flag:
+            img = add_border(img, vic.border_color)
+        
+        if upscale > 1:
+            new_width = img.width * upscale
+            new_height = img.height * upscale
+            img = img.resize((new_width, new_height), Image.NEAREST)
+            print(f"Upscaled to {new_width}x{new_height} ({upscale}x)")
+        
+        img.save(output_file)
+        print(f"Screenshot saved to {output_file}")
+        
+        return True
+        
+    finally:
+        print("Resuming machine...")
+        if api.resume():
+            print("Machine resumed successfully")
+        else:
+            print("Warning: Failed to resume machine")
+
+
 def print_help():
-    """Print usage information"""
-    print("C64U-Screenshot - Capture screenshots from Ultimate 64 via Web API")
+    print("C64U-Screenshot - Capture screenshots from Ultimate 64")
+    print("")
+    print("Captures the current screen from a running C64 program via the Ultimate 64")
+    print("Web API. Supports all graphics modes and hardware sprites.")
     print("")
     print("Usage: python C64U-Screenshot.py <IP_ADDRESS> [output.png] [options]")
     print("")
@@ -947,15 +1067,13 @@ def print_help():
     print("  --help           Show this help message and exit")
     print("  --no-border      Don't add border around screen")
     print("  --nosprites      Don't include hardware sprites in the capture")
-    print("  --upscale=N      Upscale output by factor N (e.g. --upscale=2 for 2x)")
+    print("  --upscale=N      Upscale output by factor N (e.g. --upscale=2)")
+    print("  --no-rom-bypass  Disable ROM bypass (faster, but fails on VIC bank 3)")
     print("  --password=XXX   API password if required")
     print("")
     print("Examples:")
     print("  python C64U-Screenshot.py 192.168.1.100")
-    print("  python C64U-Screenshot.py 192.168.1.100 myscreen.png")
     print("  python C64U-Screenshot.py 192.168.1.100 myscreen.png --upscale=2")
-    print("  python C64U-Screenshot.py 192.168.1.100 myscreen.png --nosprites")
-    print("  python C64U-Screenshot.py 192.168.1.100 myscreen.png --no-border")
 
 
 def main():
@@ -967,14 +1085,17 @@ def main():
     output_file = "screenshot.png"
     add_border_flag = True
     password = None
-    include_sprites = True  # Sprites enabled by default
+    include_sprites = True
     upscale = 1
+    use_rom_bypass = True
     
     for arg in sys.argv[2:]:
         if arg == "--no-border":
             add_border_flag = False
         elif arg == "--nosprites":
             include_sprites = False
+        elif arg == "--no-rom-bypass":
+            use_rom_bypass = False
         elif arg.startswith("--upscale="):
             try:
                 upscale = int(arg.split("=", 1)[1])
@@ -982,37 +1103,35 @@ def main():
                     upscale = 1
             except ValueError:
                 print(f"Error: Invalid upscale value: {arg}")
-                print("Usage: --upscale=N where N is a positive integer (e.g. --upscale=2)")
+                print("Usage: --upscale=N where N is a positive integer")
                 sys.exit(1)
         elif arg.startswith("--password="):
             password = arg.split("=", 1)[1]
         elif arg.startswith("--"):
-            # Unknown option - provide helpful error
             print(f"Error: Unknown option '{arg}'")
-            # Suggest corrections for common mistakes
             if arg in ["--scale", "--upscale", "-s"] or arg.startswith("--scale"):
                 print("Did you mean: --upscale=N (e.g. --upscale=2)")
             elif arg in ["--sprites", "--sprite"]:
                 print("Sprites are enabled by default. Use --nosprites to disable.")
             elif arg in ["--border", "--noborder"]:
                 print("Did you mean: --no-border")
+            elif arg in ["--bypass", "--rom-bypass"]:
+                print("ROM bypass is enabled by default. Use --no-rom-bypass to disable.")
             else:
                 print("Use --help for a list of valid options.")
             sys.exit(1)
         else:
-            # Not an option, treat as output filename
             output_file = arg
     
-    # Validate output file has a valid image extension
     valid_extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff']
     ext = output_file[output_file.rfind('.'):].lower() if '.' in output_file else ''
     if ext not in valid_extensions:
         print(f"Error: Output file '{output_file}' has invalid or missing extension.")
         print(f"Valid extensions: {', '.join(valid_extensions)}")
-        print("Example: python C64U-Screenshot.py 192.168.1.100 myscreen.png")
         sys.exit(1)
     
-    success = capture_screenshot(ip_address, output_file, add_border_flag, password, include_sprites, upscale)
+    success = capture_screenshot(ip_address, output_file, add_border_flag, password, 
+                                 include_sprites, upscale, use_rom_bypass)
     sys.exit(0 if success else 1)
 
 
