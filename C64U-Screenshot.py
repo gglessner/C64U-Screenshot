@@ -981,12 +981,36 @@ def main():
                 if upscale < 1:
                     upscale = 1
             except ValueError:
-                print(f"Invalid upscale value: {arg}")
+                print(f"Error: Invalid upscale value: {arg}")
+                print("Usage: --upscale=N where N is a positive integer (e.g. --upscale=2)")
                 sys.exit(1)
         elif arg.startswith("--password="):
             password = arg.split("=", 1)[1]
-        elif not arg.startswith("--"):
+        elif arg.startswith("--"):
+            # Unknown option - provide helpful error
+            print(f"Error: Unknown option '{arg}'")
+            # Suggest corrections for common mistakes
+            if arg in ["--scale", "--upscale", "-s"] or arg.startswith("--scale"):
+                print("Did you mean: --upscale=N (e.g. --upscale=2)")
+            elif arg in ["--sprites", "--sprite"]:
+                print("Sprites are enabled by default. Use --nosprites to disable.")
+            elif arg in ["--border", "--noborder"]:
+                print("Did you mean: --no-border")
+            else:
+                print("Use --help for a list of valid options.")
+            sys.exit(1)
+        else:
+            # Not an option, treat as output filename
             output_file = arg
+    
+    # Validate output file has a valid image extension
+    valid_extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff']
+    ext = output_file[output_file.rfind('.'):].lower() if '.' in output_file else ''
+    if ext not in valid_extensions:
+        print(f"Error: Output file '{output_file}' has invalid or missing extension.")
+        print(f"Valid extensions: {', '.join(valid_extensions)}")
+        print("Example: python C64U-Screenshot.py 192.168.1.100 myscreen.png")
+        sys.exit(1)
     
     success = capture_screenshot(ip_address, output_file, add_border_flag, password, include_sprites, upscale)
     sys.exit(0 if success else 1)
